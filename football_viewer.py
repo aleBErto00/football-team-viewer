@@ -213,21 +213,22 @@ def current_season_string(seasons: list[str], today: date | None = None) -> str 
 
 def pitchapi_build_index(client: PitchAPI):
     """Tutte le partite giocate della stagione corrente in tutte le competizioni."""
-    leagues = (client.get("/v1/leagues", max_age=DAY) or {}).get("leagues", [])
+    leagues = (client.get("/v1/leagues", max_age=DAY) or {}).get("leagues") or []
     print(f"Indicizzo {len(leagues)} competizioni (stagione corrente)...")
 
     def job(lg):
-        season = current_season_string(lg.get("seasons", []))
+        season = current_season_string(lg.get("seasons") or [])
         if not season:
             return []
         data = client.get(f"/v1/leagues/{lg['id']}/matches", {"season": season}, max_age=2 * 3600)
         if not data:
             return []
         out = []
-        for m in data.get("matches", []):
+        for m in (data.get("matches") or []):
             out.append({"id": m["id"], "date": m.get("date"),
                         "home": m["home_team"], "away": m["away_team"],
-                        "league": lg["name"], "season": season})
+                        "league": lg["name"], "season": season,
+                        "country": (lg.get("country_code") or "").upper()})
         return out
 
     matches: list[dict] = []
@@ -239,16 +240,58 @@ def pitchapi_build_index(client: PitchAPI):
             except PitchAPIError as err:
                 print(f"\n  ! {err}")
             progress("  competizioni", i, len(futures))
-    name_ids: dict[str, set[str]] = defaultdict(set)
+    return matches, build_candidates(matches)
+
+
+# Codici paese di competizioni "internazionali" (non indicano la nazionalita' del club)
+INTERNATIONAL_CODES = {"", "INT", "INTL", "EUR", "EU", "WLD", "WORLD", "UEFA", "CONMEBOL",
+                       "CAF", "AFC", "CONCACAF", "OFC", "XWW", "XEU", "XSA", "XNA", "XAF", "XAS"}
+
+
+def build_candidates(matches: list[dict]) -> dict[str, list[dict]]:
+    """nome squadra -> lista di squadre DISTINTE (per id) con quel nome.
+    La nazionalita' e' quella della competizione in cui la squadra gioca piu' partite
+    (escluse le competizioni internazionali), cioe' di norma il campionato nazionale."""
+    stats: dict[str, dict] = {}
     for m in matches:
         for side in ("home", "away"):
-            name_ids[m[side]["name"]].add(m[side]["id"])
-    return matches, name_ids
+            t = m[side]
+            e = stats.setdefault(t["id"], {"id": t["id"], "name": t["name"], "by_league": defaultdict(int)})
+            e["by_league"][(m["league"], m.get("country", ""))] += 1
+    by_name: dict[str, list[dict]] = defaultdict(list)
+    for e in stats.values():
+        leagues = e["by_league"]
+        domestic = {k: v for k, v in leagues.items() if k[1] not in INTERNATIONAL_CODES}
+        (lg, country) = max((domestic or leagues).items(), key=lambda kv: kv[1])[0]
+        by_name[e["name"]].append({"id": e["id"], "name": e["name"],
+                                   "country": country or "?", "league": lg})
+    return by_name
+
+
+def choose_candidate(name: str, cands: list[dict]) -> dict:
+    """Se piu' squadre hanno lo stesso nome chiede la nazionalita'."""
+    if len(cands) == 1:
+        return cands[0]
+    cands = sorted(cands, key=lambda c: (c["country"], c["league"]))
+    print(f"\nPiu' squadre si chiamano '{name}':")
+    for i, c in enumerate(cands, 1):
+        print(f"  {i}) {c['name']} - {c['country']} ({c['league']})")
+    while True:
+        a = input("Quale intendi? Inserisci il numero oppure il codice nazione: ").strip()
+        if a.isdigit() and 1 <= int(a) <= len(cands):
+            return cands[int(a) - 1]
+        hits = [c for c in cands if norm(c["country"]) == norm(a) or norm(c["league"]) == norm(a)]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            print("  Anche cosi' e' ambiguo: usa il numero.")
+        else:
+            print("  Scelta non valida.")
 
 
 def _flat_stats(item: dict) -> dict:
     flat = {}
-    for group in item.get("stats", []):
+    for group in (item.get("stats") or []):
         for st in (group.get("stats") or {}).values():
             v = st.get("stat", {}).get("value")
             if v is not None:
@@ -263,8 +306,10 @@ def pitchapi_process_match(client: PitchAPI, m: dict, ids: set[str]) -> dict | N
 
     shots = client.get(f"/v1/matches/{mid}/shots")
     if shots:
-        for period in shots.get("periods", []):
-            for s in period.get("shots", []):
+        for period in (shots.get("periods") or []):
+            for s in (period.get("shots") or []):
+                if s.get("x") is None or s.get("y") is None:
+                    continue
                 if s.get("team_id") != our and s.get("event_type") == "Goal" and not s.get("is_own_goal"):
                     res["conceded"].append({
                         "x": s["x"], "y": s["y"], "xg": s.get("expected_goals"),
@@ -281,8 +326,9 @@ def pitchapi_process_match(client: PitchAPI, m: dict, ids: set[str]) -> dict | N
         if minutes is None:   # fallback: endpoint advanced
             if adv_minutes is None:
                 adv = client.get(f"/v1/matches/{mid}/advanced/players") or {}
+                adv_list = adv.get("players") if isinstance(adv, dict) else adv
                 adv_minutes = {p["player"]["id"]: p.get("minutes_played")
-                               for p in adv.get("players", [])}
+                               for p in (adv_list or []) if isinstance(p, dict) and p.get("player")}
             minutes = adv_minutes.get(item["player"]["id"])
         if not minutes:
             continue
@@ -293,12 +339,14 @@ def pitchapi_process_match(client: PitchAPI, m: dict, ids: set[str]) -> dict | N
 
     heat = client.get(f"/v1/matches/{mid}/heatmaps")
     if heat:
-        g = heat["grid"]
-        grid = np.zeros((g["length"], g["width"]))
-        for t in heat.get("teams", []):
-            if t["team"]["id"] == our:
-                for cx, cy, n in t.get("cells", []):
-                    grid[cx, cy] += n
+        g = heat.get("grid") or {}
+        L, W = g.get("length", 16), g.get("width", 12)
+        grid = np.zeros((L, W))
+        for t in (heat.get("teams") or []):
+            if (t.get("team") or {}).get("id") == our:
+                for cx, cy, n in (t.get("cells") or []):
+                    if 0 <= cx < L and 0 <= cy < W:
+                        grid[cx, cy] += n
         res["grid"] = grid
     return res
 
@@ -323,6 +371,8 @@ def collect_pitchapi(client: PitchAPI, team: str, ids: set[str], index: list[dic
                     results.append(r)
             except PitchAPIError as err:
                 print(f"\n  ! {err}")
+            except Exception as err:   # una partita con dati anomali non blocca il resto
+                print(f"\n  ! partita saltata ({type(err).__name__}: {err})")
             progress("  partite", i, len(futures))
 
     d.n_matches = len(results)
@@ -331,7 +381,7 @@ def collect_pitchapi(client: PitchAPI, team: str, ids: set[str], index: list[dic
     for r in results:
         d.conceded.extend(r["conceded"])
         if r["grid"] is not None:
-            total_grid = r["grid"] if total_grid is None else total_grid + r["grid"]
+            total_grid = r["grid"] if total_grid is None else (total_grid + r["grid"] if total_grid.shape == r["grid"].shape else total_grid)
         for pid, p in r["players"].items():
             a = agg[pid]
             a["name"] = p["name"]
@@ -722,16 +772,18 @@ def main() -> None:
     if args.source == "pitchapi":
         client = PitchAPI(get_pitchapi_key())
         try:
-            index, name_ids = pitchapi_build_index(client)
+            index, cands_by_name = pitchapi_build_index(client)
         except (PitchAPIError, requests.RequestException) as err:
             sys.exit(f"Errore PitchAPI: {err}")
         if not index:
             sys.exit("Nessuna partita trovata per la stagione corrente.")
-        names = {norm(n): n for n in name_ids}
+        names = {norm(n): n for n in cands_by_name}
         team = resolve_team(args.team, names) if args.team else ask_team(names)
         if not team:
             return
-        data = collect_pitchapi(client, team, name_ids[team], index)
+        cand = choose_candidate(team, cands_by_name[team])
+        label = team if len(cands_by_name[team]) == 1 else f"{team} ({cand['country']})"
+        data = collect_pitchapi(client, label, {cand["id"]}, index)
     else:
         try:
             index = sb_build_index()
